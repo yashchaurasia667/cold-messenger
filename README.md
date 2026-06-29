@@ -20,8 +20,15 @@ A command-line tool that extracts business names from Google Maps URLs and uses 
 
 2. **Set your API Key:**
    You need a Google Gemini API key to generate the messages. Get one from Google AI Studio.
+   
+   **For Linux/macOS (Bash):**
    ```bash
    export GEMINI_API_KEY="your_api_key_here"
+   ```
+   
+   **For Windows (PowerShell):**
+   ```powershell
+   $env:GEMINI_API_KEY="your_api_key_here"
    ```
 
 ## Usage

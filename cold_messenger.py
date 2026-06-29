@@ -19,26 +19,7 @@ def resolve_url(url):
         print(f"Warning: Could not resolve URL {url}: {e}")
         return url
 
-def fetch_and_clean_html(url):
-    """
-    Fetches the HTML of the URL and returns a cleaned text version
-    to save tokens when passing to Gemini.
-    """
-    try:
-        req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
-        html = urllib.request.urlopen(req).read().decode('utf-8', errors='ignore')
-        
-        # Remove scripts and styles
-        html = re.sub(r'<script.*?>.*?</script>', '', html, flags=re.DOTALL | re.IGNORECASE)
-        html = re.sub(r'<style.*?>.*?</style>', '', html, flags=re.DOTALL | re.IGNORECASE)
-        # Remove HTML tags
-        text = re.sub(r'<.*?>', ' ', html, flags=re.DOTALL)
-        # Normalize whitespace
-        text = re.sub(r'\s+', ' ', text)
-        return text
-    except Exception as e:
-        print(f"Warning: Could not fetch HTML for phone number extraction: {e}")
-        return ""
+
 
 def extract_name_from_url(url):
     """
@@ -56,9 +37,10 @@ def extract_name_from_url(url):
         return name, url
     return None, url
 
-def process_business_with_gemini(place_name, context, api_key, extract_phone=False, page_text=""):
+def process_business_with_gemini(place_name, context, api_key, extract_phone=False):
     """
-    Uses the Gemini API to draft a cold message and optionally extract a phone number in a single request.
+    Uses the Gemini API to draft a cold message and optionally extract a phone number in a single request,
+    utilizing Google Search grounding for reliable extraction.
     Outputs as JSON to guarantee structured extraction.
     """
     try:
@@ -78,35 +60,43 @@ def process_business_with_gemini(place_name, context, api_key, extract_phone=Fal
         
     prompt += "\nKeep the message professional, engaging, and under 150 words."
     
-    if extract_phone and page_text:
-        # Pre-extract potential phone numbers to drastically save tokens and speed up API.
-        # We look for strings that look like phone numbers (digits, spaces, hyphens, plus signs)
-        phone_candidates = re.findall(r'[\+\(]?[0-9][0-9 .\-\(\)]{8,15}[0-9]', page_text)
-        # Remove obvious coordinates or timestamps (long numbers without + or spaces if they are just pure digits)
-        phone_candidates = [c for c in phone_candidates if len(re.sub(r'\D', '', c)) >= 8]
-        candidates_str = ", ".join(phone_candidates[:50]) # limit to first 50 matches
-        
+    config_args = {}
+    
+    if extract_phone:
         prompt += (
-            "\n\nI am also providing you with a list of potential phone number strings extracted from their Google Maps page. "
-            "Identify the correct business phone number from these. It should be formatted in international format (e.g., +919876543210). "
-            f"\nCANDIDATES: {candidates_str}\n"
+            f"\n\nAlso, use Google Search to find the official, public phone number for '{place_name}'. "
+            "Identify the correct business phone number from the search results. It should be formatted in international format (e.g., +919876543210). "
         )
+        # Enable Google Search grounding
+        config_args["tools"] = [{"google_search": {}}]
+    else:
+        # We can use JSON mime type if no tools are used
+        config_args["response_mime_type"] = "application/json"
     
     prompt += (
-        "\n\nYou must return the result as a valid JSON object with two keys:\n"
+        "\n\nYou must return the result as a valid JSON object with exactly two keys:\n"
         "1. 'message': The drafted cold message.\n"
         "2. 'phone_number': The extracted phone number (or null if none found / not requested)."
+        "\nReturn ONLY the raw JSON object, without any markdown formatting or code blocks."
     )
 
     try:
         response = client.models.generate_content(
             model='gemini-2.5-flash',
             contents=prompt,
-            config=types.GenerateContentConfig(
-                response_mime_type="application/json",
-            ),
+            config=types.GenerateContentConfig(**config_args),
         )
-        result = json.loads(response.text.strip())
+        
+        # Clean up possible markdown wrappers
+        text = response.text.strip()
+        if text.startswith('```json'):
+            text = text[7:]
+        elif text.startswith('```'):
+            text = text[3:]
+        if text.endswith('```'):
+            text = text[:-3]
+            
+        result = json.loads(text.strip())
         return result.get('message', "Failed to generate message."), result.get('phone_number')
     except Exception as e:
         print(f"Error generating content with Gemini API: {e}")
@@ -129,12 +119,8 @@ def main():
         sys.exit(1)
 
     if args.whatsapp:
-        try:
-            import pywhatkit
-        except ImportError:
-            print("Error: pywhatkit is not installed. Required for sending WhatsApp messages.")
-            print("Please run: pip install pywhatkit")
-            sys.exit(1)
+        # We will use Python's built-in webbrowser instead of pywhatkit to avoid X11/Wayland display errors
+        import webbrowser
 
     # Read context from file if provided
     context_str = args.context
@@ -183,10 +169,8 @@ def main():
             print(f"Warning: Could not extract place name from URL: {url}")
             place_name = "the business"
             
-        page_text = ""
         if args.whatsapp:
-            print("Fetching Maps page for phone number extraction...")
-            page_text = fetch_and_clean_html(resolved_url)
+            print("Using Google Search via Gemini to find phone number...")
             
         print(f"Drafting message for: {place_name}...")
         
@@ -194,8 +178,7 @@ def main():
             place_name, 
             context_str, 
             api_key, 
-            extract_phone=args.whatsapp, 
-            page_text=page_text
+            extract_phone=args.whatsapp
         )
         
         if args.whatsapp:
@@ -219,14 +202,18 @@ def main():
             print(f"Error saving to {file_path}: {e}")
             
         if args.whatsapp and phone_number:
-            print(f"Opening WhatsApp Web to message {phone_number}...")
-            import pywhatkit
+            print(f"Opening WhatsApp Web for {phone_number}...")
+            # Clean phone number for URL (remove +, spaces, hyphens)
+            clean_phone = re.sub(r'\D', '', phone_number)
+            encoded_message = urllib.parse.quote(message)
+            whatsapp_url = f"https://web.whatsapp.com/send?phone={clean_phone}&text={encoded_message}"
+            
             try:
-                # wait_time is 15 seconds to allow WhatsApp web to load
-                pywhatkit.sendwhatmsg_instantly(phone_number, message, wait_time=15, tab_close=True, close_time=3)
-                print("Message sent/queued successfully in WhatsApp Web.")
+                import webbrowser
+                webbrowser.open(whatsapp_url)
+                print("WhatsApp Web opened. Please hit 'Send' in your browser.")
             except Exception as e:
-                print(f"Failed to send WhatsApp message: {e}")
+                print(f"Failed to open browser: {e}")
 
         # Sleep to avoid rate limits, unless it's the last URL
         if i < len(urls) - 1:
