@@ -5,6 +5,7 @@ import re
 import os
 import sys
 import time
+import json
 
 def resolve_url(url):
     """
@@ -55,48 +56,14 @@ def extract_name_from_url(url):
         return name, url
     return None, url
 
-def extract_phone_number(text, api_key):
+def process_business_with_gemini(place_name, context, api_key, extract_phone=False, page_text=""):
     """
-    Uses Gemini to extract a phone number from the cleaned page text.
-    """
-    try:
-        from google import genai
-    except ImportError:
-        return None
-
-    client = genai.Client(api_key=api_key)
-    
-    # Truncate text to ensure we don't exceed token limits, though 1M is plenty.
-    # 100k characters is more than enough for a Google Maps page text dump.
-    truncated_text = text[:100000]
-    
-    prompt = (
-        "You are an expert data extractor. I am providing you with the text extracted from a Google Maps page. "
-        "Find the phone number of the business. If you find one, return ONLY the phone number in international format "
-        "(e.g., +919876543210 or +1234567890). If you cannot find a phone number, return ONLY the exact word 'None'. "
-        "Do not include any explanation or other text.\n\n"
-        f"TEXT:\n{truncated_text}"
-    )
-
-    try:
-        response = client.models.generate_content(
-            model='gemini-2.5-flash',
-            contents=prompt,
-        )
-        result = response.text.strip()
-        if result.lower() == 'none' or not any(char.isdigit() for char in result):
-            return None
-        return result
-    except Exception as e:
-        print(f"Error extracting phone number with Gemini: {e}")
-        return None
-
-def draft_message(place_name, context, api_key):
-    """
-    Uses the Gemini API to draft a cold message.
+    Uses the Gemini API to draft a cold message and optionally extract a phone number in a single request.
+    Outputs as JSON to guarantee structured extraction.
     """
     try:
         from google import genai
+        from google.genai import types
     except ImportError:
         print("Error: google-genai is not installed. Please run 'pip install -r requirements.txt'")
         sys.exit(1)
@@ -109,17 +76,41 @@ def draft_message(place_name, context, api_key):
     else:
         prompt += " The purpose is a general inquiry about their services or potential collaboration."
         
-    prompt += "\nKeep it professional, engaging, and under 150 words."
+    prompt += "\nKeep the message professional, engaging, and under 150 words."
+    
+    if extract_phone and page_text:
+        # Pre-extract potential phone numbers to drastically save tokens and speed up API.
+        # We look for strings that look like phone numbers (digits, spaces, hyphens, plus signs)
+        phone_candidates = re.findall(r'[\+\(]?[0-9][0-9 .\-\(\)]{8,15}[0-9]', page_text)
+        # Remove obvious coordinates or timestamps (long numbers without + or spaces if they are just pure digits)
+        phone_candidates = [c for c in phone_candidates if len(re.sub(r'\D', '', c)) >= 8]
+        candidates_str = ", ".join(phone_candidates[:50]) # limit to first 50 matches
+        
+        prompt += (
+            "\n\nI am also providing you with a list of potential phone number strings extracted from their Google Maps page. "
+            "Identify the correct business phone number from these. It should be formatted in international format (e.g., +919876543210). "
+            f"\nCANDIDATES: {candidates_str}\n"
+        )
+    
+    prompt += (
+        "\n\nYou must return the result as a valid JSON object with two keys:\n"
+        "1. 'message': The drafted cold message.\n"
+        "2. 'phone_number': The extracted phone number (or null if none found / not requested)."
+    )
 
     try:
         response = client.models.generate_content(
             model='gemini-2.5-flash',
             contents=prompt,
+            config=types.GenerateContentConfig(
+                response_mime_type="application/json",
+            ),
         )
-        return response.text.strip()
+        result = json.loads(response.text.strip())
+        return result.get('message', "Failed to generate message."), result.get('phone_number')
     except Exception as e:
-        print(f"Error generating message with Gemini API: {e}")
-        return "Failed to generate message."
+        print(f"Error generating content with Gemini API: {e}")
+        return "Failed to generate message.", None
 
 def main():
     parser = argparse.ArgumentParser(description="Draft cold messages for businesses from Google Maps links.")
@@ -128,6 +119,7 @@ def main():
     parser.add_argument('-c', '--context', type=str, help='Context or offer to include in the message.', default="")
     parser.add_argument('-C', '--context-file', type=str, help='Path to a txt file containing the context/offer.')
     parser.add_argument('-w', '--whatsapp', action='store_true', help='Automatically open WhatsApp Web and send the message if a phone number is found.')
+    parser.add_argument('--delay', type=int, default=12, help='Delay in seconds between processing each business to avoid API rate limits (default: 12).')
     
     args = parser.parse_args()
     
@@ -183,33 +175,39 @@ def main():
         os.makedirs(output_dir)
         print(f"Created directory: {output_dir}/")
             
-    for url in urls:
-        print(f"\nProcessing URL: {url}")
+    for i, url in enumerate(urls):
+        print(f"\n[{i+1}/{len(urls)}] Processing URL: {url}")
         
         place_name, resolved_url = extract_name_from_url(url)
         if not place_name:
             print(f"Warning: Could not extract place name from URL: {url}")
             place_name = "the business"
             
-        print(f"Drafting message for: {place_name}...")
-        message = draft_message(place_name, context_str, api_key)
-        
-        # Phone number extraction
-        phone_number = None
+        page_text = ""
         if args.whatsapp:
-            print("Extracting phone number from Maps page...")
+            print("Fetching Maps page for phone number extraction...")
             page_text = fetch_and_clean_html(resolved_url)
-            if page_text:
-                phone_number = extract_phone_number(page_text, api_key)
-                if phone_number:
-                    print(f"Found phone number: {phone_number}")
-                else:
-                    print("No phone number could be extracted.")
+            
+        print(f"Drafting message for: {place_name}...")
+        
+        message, phone_number = process_business_with_gemini(
+            place_name, 
+            context_str, 
+            api_key, 
+            extract_phone=args.whatsapp, 
+            page_text=page_text
+        )
+        
+        if args.whatsapp:
+            if phone_number:
+                print(f"Found phone number: {phone_number}")
+            else:
+                print("No phone number could be extracted.")
         
         # Sanitize place_name for use as a filename
         safe_filename = re.sub(r'[^\w\s-]', '', place_name).strip().replace(' ', '_')
         if not safe_filename:
-            safe_filename = "business_message"
+            safe_filename = f"business_message_{i+1}"
             
         file_path = os.path.join(output_dir, f"{safe_filename}.txt")
         
@@ -227,10 +225,13 @@ def main():
                 # wait_time is 15 seconds to allow WhatsApp web to load
                 pywhatkit.sendwhatmsg_instantly(phone_number, message, wait_time=15, tab_close=True, close_time=3)
                 print("Message sent/queued successfully in WhatsApp Web.")
-                # Add a small delay before processing the next one to avoid issues with multiple tabs
-                time.sleep(5)
             except Exception as e:
                 print(f"Failed to send WhatsApp message: {e}")
+
+        # Sleep to avoid rate limits, unless it's the last URL
+        if i < len(urls) - 1:
+            print(f"Sleeping for {args.delay} seconds to avoid Gemini API rate limits...")
+            time.sleep(args.delay)
 
 if __name__ == "__main__":
     main()
